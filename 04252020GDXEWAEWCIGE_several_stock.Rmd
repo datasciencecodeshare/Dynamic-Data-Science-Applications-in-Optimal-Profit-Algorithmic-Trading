@@ -1,0 +1,411 @@
+---
+title: "Dynamic Data Science Applications in Optimal Profit Algorithmic Trading"
+output:
+  html_document: default
+  pdf_document: default
+fontsize: 12pt  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The file contains the source code of the data applications of the trading strategies presented in *Dynamic Data Science Applications in Optimal Profit Algorithmic Trading*.
+
+# Load required packages
+```{r, message=FALSE, warning=FALSE}
+pkg_list = c('quantmod', 'TTR', 'zoo', 'tseries', 'fGarch','PEIP','gdata',
+             'gridExtra','tidyverse', 'aTSA', 'dygraphs', 'urca')
+# Function to install required packages if needed
+for (pkg in pkg_list)
+{
+  # Loading the library.
+  if (!library(pkg, logical.return=TRUE, character.only=TRUE))
+    {
+         # If the library cannot be loaded, install first and then load.
+        install.packages(pkg)
+        library(pkg, character.only=TRUE)
+  }
+}
+```
+# Load the required stocks
+```{r, warning=FALSE, message=FALSE}
+start.date = '2017-2-1' # starting date of stock
+end.date = '2019-3-17' # ending date of stock
+# Download the selected stocks from Yahoo finance
+getSymbols(c('SPY','ADBE','EBAY','MSFT','IBM','GLD','GDX','EWA','EWC','IGE'), 
+                      src = "yahoo", from = start.date, to = end.date)
+stocks <-merge(SPY = SPY[, "SPY.Adjusted"], ADBE = ADBE[, "ADBE.Adjusted"], 
+               EBAY= EBAY[, "EBAY.Adjusted"], MSFT = MSFT[, "MSFT.Adjusted"], 
+               IBM = IBM[, "IBM.Adjusted"], GLD = GLD[, "GLD.Adjusted"], 
+               GDX = GDX[, "GDX.Adjusted"], EWA = EWA[, "EWA.Adjusted"], 
+               EWC = EWC[, "EWC.Adjusted"], IGE = IGE[, "IGE.Adjusted"])
+head(stocks)
+```
+## Function to select cointegrated pairs 
+```{r}
+find_cointegrated_pairs <- function (data){
+  n <- ncol (data)
+  pvalue_matrix <- matrix(0, nrow=n, ncol=n)
+  pairs <- list()
+  m <- 1
+  for (i in 1:n){
+    for (j in 1:n){
+      if(i>=j) { 
+        next;
+      } else{
+      S1 <- data[, i]
+      S2 <- data[, j]
+      result <- coint.test (as.numeric(S1), as.numeric(S2), output = FALSE)
+      pvalue_matrix [i, j] <- result[,3][[1]]
+      if (result[,3][[1]] < 0.05){
+        pairs [[m]] <- c (i, j)
+        m <- m+1}
+      }
+    }
+  }
+  newlist <- list(pvalue_matrix, pairs)
+  return (newlist)
+}
+```
+## Calculate p-value to identify cointegrated pairs
+```{r}
+pvalue<-find_cointegrated_pairs(stocks)
+#round(pvalue[[1]],3)
+```
+## Plot the stock prices and test for multiple cointegration 
+```{r}
+assets <- c("EWA", "EWC") # selected two assets
+pair.stock <- merge(stocks[, 8], stocks[, 9], join="inner")
+colnames(pair.stock) <- assets
+# Plot the assets 
+plot(pair.stock, legend.loc=1)
+# Test of multiple cointegration
+jotest=ca.jo(pair.stock, type="trace", K=2, ecdet="none", spec="longrun")
+summary(jotest)
+```
+
+# Implementation of Non-Gaussian filter algorithm for two stocks
+```{r}
+# select pairwise cointegrated stocks
+x <- pair.stock[, 1]
+y <- pair.stock[, 2]
+x$intercept <- rep(1, nrow(x)) # create intercept
+var_e <- 0.0001 # innovation covariance of observation
+sigma_v <- var_e/(1-var_e)*diag(2) #covariance matrix of state
+Ve <- 0.001
+P_t <- matrix(rep(0, 4), nrow=2)
+P <- matrix(rep(0, 4), nrow=2)
+beta <- matrix(rep(0, nrow(y)*2), ncol=2)
+y_fitted <- rep(0, nrow(y))
+nu <- rep(0, nrow(y))
+Q <- rep(0, nrow(y))
+################################################################
+# Function to implements the iterative Non-Gaussian filter operations
+################################################################
+kalman_iteration <- function(y, x) {
+for(i in 1:nrow(y)) {
+  if(i > 1) {
+    beta[i, ] <- beta[i-1, ] # state transition
+    P_t <- P + sigma_v # state covariance prediction
+    }
+  y_fitted[i] <- x[i, ] %*% beta[i, ] # observation prediction
+  Q[i] <- x[i, ] %*% P_t %*% t(x[i, ]) + Ve # observation variance prediction
+  nu[i] <- y[i] - y_fitted[i] # prediction error
+  K_gain <- P_t %*% t(x[i, ]) / Q[i] # information gain
+  # updating the state
+  beta[i, ] <- beta[i, ] + K_gain * nu[i]
+  P <- P_t - K_gain %*% x[i, ] %*% P_t
+}
+  return(list(beta, P, Q, nu))
+}
+
+res <- kalman_iteration(y,x) # Implementation of function
+# Extract results
+beta <- xts(res[[1]], order.by=index(pair.stock))
+plot(beta[2:nrow(beta), 1],type='l',main ='Dynamic hedge ratio',col = "blue")
+plot(beta[2:nrow(beta), 2],type='l',main ='Dynamic intercept',col = "blue")
+```
+
+```{r}
+# plot trade signals
+nu <- xts(res[[4]], order.by=index(pair.stock))
+sqrtQ <- xts(sqrt(res[[3]]), order.by=index(pair.stock))
+signals <- merge(nu, sqrtQ, -sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+```
+### Functions to calculate the optimal value of threshold $p$, which maximizes the Sharpe ratio (SR) and cumulative profit
+```{r}
+#############################################################
+# Required functions to calculate p and profit
+#############################################################
+# Function to generate positions and calculate profit and loss for multiple stocks
+PnL<-function(signals,nu,beta,x,y){
+len <- length(index(signals)) 
+vec.sig<-ifelse((signals[1:len]$nu > signals[1:len]$sqrtQ) & 
+                  (lag.xts(signals$nu, 1) < lag.xts(signals$sqrtQ, 1)), -1, 
+         ifelse((signals[1:len]$nu < signals[1:len]$negsqrtQ) & 
+                 (lag.xts(signals$nu, 1) > lag.xts(signals$negsqrtQ, 1)), 1, 0))
+colnames(vec.sig) <- "vectorise.signals"
+# getting only the first signals
+vec.sig[vec.sig == 0] <- NA # replace 0 by NA
+vec.sig <- na.locf(vec.sig) # replace the missing values by last real observations
+vec.sig <- diff(vec.sig)/2
+# generate positions and calculate profit for two stocks
+if(ncol(beta)==2){
+sim <- merge(lag.xts(vec.sig,1), beta[, 1], x[, 1], y)
+colnames(sim) <- c("sig", "hedge", assets[1], assets[2])
+sim$posX <- sim$sig * -1000 * sim$hedge
+sim$posY <- sim$sig * 1000   
+sim$posX[sim$posX == 0] <- NA
+sim$posX <- na.locf(sim$posX)
+sim$posY[sim$posY == 0] <- NA
+sim$posY <- na.locf(sim$posY)
+PLX <- sim$posX * diff(sim[, assets[1]])
+PLY <- sim$posY * diff(sim[, assets[2]])
+profit_loss <- PLX + PLY
+  }
+# generate positions and calculate profit for three stocks
+if(ncol(beta)==3){
+sim <- merge(lag.xts(vec.sig,1), beta[, 1], beta[, 2], x[, 1], x[, 2], y)
+colnames(sim) <- c("sig", "hedge1", "hedge2", assets[1], assets[2], assets[3])
+sim$posX1 <- sim$sig * -1000 * sim$hedge1
+sim$posX2 <- sim$sig * -1000 * sim$hedge2
+sim$posY <- sim$sig * 1000   
+sim$posX1[sim$posX1 == 0] <- NA
+sim$posX1 <- na.locf(sim$posX1)
+sim$posX2[sim$posX2 == 0] <- NA
+sim$posX2 <- na.locf(sim$posX2)
+sim$posY[sim$posY == 0] <- NA
+sim$posY <- na.locf(sim$posY)
+PLX <- sim$posX1 * diff(sim[, assets[1]]) + sim$posX2 * diff(sim[, assets[2]])
+PLY <- sim$posY * diff(sim[, assets[3]])
+profit_loss <- PLX + PLY
+   }
+# generate positions and calculate profit for four stocks
+if(ncol(beta)==4){
+sim <- merge(lag.xts(vec.sig,1), beta[,1], beta[,2], beta[,3], x[,1], x[,2], x[,3], y)
+colnames(sim) <- c("sig", "hedge1", "hedge2", "hedge3",assets[1],assets[2], 
+                   assets[3], assets[4])
+sim$posX1 <- sim$sig * -1000 * sim$hedge1
+sim$posX2 <- sim$sig * -1000 * sim$hedge2
+sim$posX3 <- sim$sig * -1000 * sim$hedge3
+sim$posY <- sim$sig * 1000   
+sim$posX1[sim$posX1 == 0] <- NA
+sim$posX1 <- na.locf(sim$posX1)
+sim$posX2[sim$posX2 == 0] <- NA
+sim$posX2 <- na.locf(sim$posX2)
+sim$posX3[sim$posX3 == 0] <- NA
+sim$posX3 <- na.locf(sim$posX3)
+sim$posY[sim$posY == 0] <- NA
+sim$posY <- na.locf(sim$posY)
+PLX <- sim$posX1 * diff(sim[, assets[1]]) + sim$posX2 * diff(sim[, assets[2]]) + 
+                              sim$posX3 * diff(sim[, assets[3]])
+PLY <- sim$posY * diff(sim[, assets[2]])
+profit_loss <- PLX + PLY
+    }
+return(ProfitLoss=profit_loss)
+}
+# Functions to calculate the optimal value of threshold, $p$
+SR.train<-function(nu, sqrtQ, p){
+signals <- merge(nu, p*sqrtQ, -p*sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+# Implementation of profit
+profit.loss<- PnL(signals,nu,beta,x,y)
+st_p <- sqrt(252)*mean(na.omit(profit.loss))/sd(na.omit(profit.loss))
+return (st_p)
+} 
+```
+
+```{r}
+# determining optimal p to maximize Sharpe ratio 
+p <- seq(0.1, 2, 0.01)
+SR<-0
+for(j in 1:length(p)){
+      SR[j] <- SR.train (nu, sqrtQ, p[j])
+    }
+max(na.omit(SR))
+plot(p, SR, type = "l", col = "blue")
+```
+## Calcualte the optimal value of p by maximizing the SR
+```{r}
+p.opt<-p[which.max(SR)]
+p.opt
+```
+
+```{r}
+# create optimal trading signals
+p <- p.opt
+signals <- merge(nu, p*sqrtQ, -p*sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+plot(signals[3:length(index(signals))], ylab='nu', main = 'Trading signals', 
+              col=c('blue', 'red', 'red'), lwd=c(1,2,2))
+```
+## Calculate the cumulative profit using optimal trading signals
+```{r}
+# Implementation of profit and loss fucntion to calculate cumulative profit
+profit.loss<- PnL(signals,nu,beta,x,y)
+sum (na.omit(profit.loss))
+plot(cumsum(na.omit(profit.loss)), main="Cumulative profit, $", col = "blue")
+```
+
+# Implementation of Non-Gaussian filter for multiple trading (three stocks)
+
+```{r}
+assets <- c("EWA", "EWC", "IGE")
+three.stocks <- merge(stocks[, 8], stocks[, 9], stocks [, 10])
+colnames(three.stocks) <- assets
+plot(three.stocks, legend.loc=1)
+jotest=ca.jo(three.stocks, type="trace", K=2, ecdet="none", spec="longrun")
+summary(jotest)
+```
+## Implementation of Non-Gaussian filter algorithm
+```{r}
+x <- three.stocks[, 1:2]
+y <- three.stocks[, 3]
+x$intercept <- rep(1, nrow(x)) # creating intercept
+var_e <- 0.0001 # innovation covariance of observations
+sigma_v <- var_e/(1-var_e)*diag(3) # covariance matrix of state
+#sigma_v 
+Ve <- 0.001
+P_t <- matrix(rep(0, 9), nrow=3)
+P <- matrix(rep(0, 9), nrow=3)
+beta <- matrix(rep(0, nrow(y)*3), ncol=3)
+y_fitted <- rep(0, nrow(y))
+nu <- rep(0, nrow(y))
+Q <- rep(0, nrow(y))
+# Implementation of function of iterative Non-Gaussian filter operations
+res <- kalman_iteration(y,x)
+# Extract results
+beta <- xts(res[[1]], order.by=index(three.stocks))
+plot(beta[2:nrow(beta), 1:2], type='l', main = 'Dynamic hedge ratios', 
+     col = c("blue", "green"))
+plot(beta[2:nrow(beta), 3], type='l', main = 'Dynamic updated intercept', col = "blue")
+```
+
+```{r}
+# plot trade signals
+nu <- xts(res[[4]], order.by=index(three.stocks))
+sqrtQ <- xts(sqrt(res[[3]]), order.by=index(three.stocks))
+signals <- merge(nu, sqrtQ, -sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+```
+
+```{r}
+# determining optimal p to maximize Sharpe ratio 
+p <- seq(0.1, 2, 0.01)
+SR<-0
+for(j in 1:length(p)){
+      SR[j] <- SR.train (nu, sqrtQ, p[j])
+    }
+max(na.omit(SR))
+plot(p, SR, type = "l", col = "blue", ylab = "Annualized SR")
+```
+## Calcualte the optimal value of p by maximizing the SR
+```{r}
+p.opt<-p[which.max(SR)]
+p.opt
+```
+
+```{r}
+# create optimal trading signals
+p <- p.opt
+signals <- merge(nu, p*sqrtQ, -p*sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+plot(signals[3:length(index(signals))], ylab='nu', main = 'Trading signals', 
+                col=c('blue', 'red', 'red'), lwd=c(1,2,2))
+```
+## Calculate the cumulative profit using optimal trading signals
+```{r}
+# Implementation of profit and loss fucntion to calculate cumulative profit
+profit.loss<- PnL(signals,nu,beta,x,y)
+sum (na.omit(profit.loss))
+plot(cumsum(na.omit(profit.loss)), main="Cumulative profit, $", col = "blue")
+```
+
+# Implementation of Non-Gaussian filter for multiple trading (four stocks)
+
+## Plot and test for the presence of cointegration between stocks 
+```{r}
+assets <- c("GDX", "EWA", "EWC", "IGE")
+four.stocks <- merge(stocks[, 7], stocks[, 8], stocks[, 9], stocks [, 10])
+colnames(four.stocks) <- assets
+plot(four.stocks, legend.loc=1)
+jotest=ca.jo(four.stocks, type="trace", K=2, ecdet="none", spec="longrun")
+summary(jotest)
+```
+## Implementation of Non-Gaussian filter algorithm
+```{r}
+x <- four.stocks[, 1:3]
+y <- four.stocks[, 4]
+x$intercept <- rep(1, nrow(x)) # Creating intercept
+var_e <- 0.0001 # innovation covariance of observations
+sigma_v <- var_e/(1-var_e)*diag(4) # covariance matrix of state
+#sigma_v 
+Ve <- 0.001
+P_t <- matrix(rep(0, 16), nrow=4)
+P <- matrix(rep(0, 16), nrow=4)
+beta <- matrix(rep(0, nrow(y)*4), ncol=4)
+y_fitted <- rep(0, nrow(y))
+nu <- rep(0, nrow(y))
+Q <- rep(0, nrow(y))
+# Implementation of function of iterative Non-Gaussian filter operations
+res <- kalman_iteration(y,x)
+# Extract results
+beta <- xts(res[[1]], order.by=index(four.stocks))
+plot(beta[2:nrow(beta), 1:3], type='l', main = 'Dynamic updated hedge ratios', 
+     col = c("blue", "green", "red"))
+plot(beta[2:nrow(beta), 4], type='l', main = 'Dynamic updated intercept', col = "blue")
+```
+
+```{r}
+# plot trading signals
+nu <- xts(res[[4]], order.by=index(four.stocks))
+sqrtQ <- xts(sqrt(res[[3]]), order.by=index(four.stocks))
+signals <- merge(nu, sqrtQ, -sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+```
+
+```{r}
+# determining optimal p to maximize Sharpe ratio 
+p <- seq(0.1, 2, 0.01)
+SR<-0
+for(j in 1:length(p)){
+      SR[j] <- SR.train (nu, sqrtQ, p[j])
+    }
+max(na.omit(SR))
+plot(p, SR, type = "l", col = "blue", ylab = "Annualized SR")
+```
+## Calcualte the optimal value of p by maximizing the SR
+```{r}
+p.opt<-p[which.max(SR)]
+p.opt
+```
+
+```{r}
+# create optimal trading signals
+p <- p.opt
+signals <- merge(nu, p*sqrtQ, -p*sqrtQ)
+colnames(signals) <- c("nu", "sqrtQ", "negsqrtQ")
+plot(signals[3:length(index(signals))], ylab='nu', main = 'Trading signals', 
+                col=c('blue', 'red', 'red'), lwd=c(1,2,2))
+```
+## Calculate the cumulative profit using optimal trading signals
+```{r}
+# Implementation of profit and loss fucntion to calculate cumulative profit
+profit.loss<- PnL(signals,nu,beta,x,y)
+
+plot(cumsum(na.omit(profit.loss)), main="Cumulative profit, $", col = "blue")
+sum (na.omit(profit.loss))
+```
+# Buy and hold strategy
+```{r}
+maxx<- nrow (stocks)
+GDX <- as.numeric(stocks [maxx, 7]) - as.numeric(stocks [1, 7])
+EWA <- as.numeric(stocks [maxx, 8]) - as.numeric(stocks [1, 8])
+EWC <- as.numeric(stocks [maxx, 9]) - as.numeric(stocks [1, 9])
+IGE <- as.numeric(stocks [maxx, 10]) - as.numeric(stocks [1, 10])
+1000*(EWA + EWC)
+1000*(EWA + EWC + IGE)
+1000*(GDX + EWA + EWC + IGE)
+```
